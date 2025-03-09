@@ -1,98 +1,97 @@
-
-
 import streamlit as st
+import boto3
 import os
-import subprocess
-import textwrap
+import json
 import time
-import glob
-from transformers import pipeline
+import io
+import requests
+import ffmpeg
+import base64
+import pandas as pd
 
+# AWS Configurations
+AWS_REGION = "us-east-1"
+S3_BUCKET = "medicaltranscriptionbacke-medicaltranscriptionback-dpapkt0xat7l"
+DYNAMODB_TABLE = "SentimentAnalysisResults"
 
+# AWS Clients
+s3_client = boto3.client("s3", region_name=AWS_REGION)
+transcribe_client = boto3.client("transcribe", region_name=AWS_REGION)
+comprehend_client = boto3.client("comprehendmedical", region_name=AWS_REGION)
+dynamodb_client = boto3.resource("dynamodb", region_name=AWS_REGION)
 
-# Title
-st.title("🎬 Video Sentiment Analysis")
-st.write("Upload a video, extract audio, transcribe speech, and analyze sentiment!")
+# Streamlit UI
+st.title("🎥 Video Sentiment Analysis (AWS-Powered)")
 
-# File Upload
-video_file = st.file_uploader("Upload a video file", type=["mp4", "mov", "avi"])
+# 📂 File Upload
+uploaded_file = st.file_uploader("📤 Upload a video", type=["mp4", "avi", "mov"])
 
-if video_file is not None:
-    # Save uploaded file
-    video_path = "uploaded_video.mp4"
-    with open(video_path, "wb") as f:
-        f.write(video_file.read())
+if uploaded_file:
+    video_name = uploaded_file.name
+    s3_video_uri = f"s3://{S3_BUCKET}/{video_name}"
 
-    # Display video
-    st.video(video_path)
+    # Upload video to S3
+    s3_client.upload_fileobj(uploaded_file, S3_BUCKET, video_name)
+    st.success(f"✅ Video uploaded to S3: {s3_video_uri}")
 
-    # Extract audio
-    audio_path = "audio.wav"
+    # Extract Audio from Video
+    audio_path = f"temp_audio_{video_name}.mp3"
+    with open(audio_path, "wb") as f:
+        f.write(uploaded_file.read())  # Save uploaded file as a temp audio file
 
-    # Delete old files to prevent conflicts
-    for file in glob.glob("*.txt") + [audio_path]:
-        if os.path.exists(file):
-            os.remove(file)
+    s3_audio_uri = f"s3://{S3_BUCKET}/{audio_path}"
+    s3_client.upload_file(audio_path, S3_BUCKET, audio_path)
+    st.success(f"✅ Audio extracted and uploaded to S3: {s3_audio_uri}")
 
-    st.subheader("🔊 Extracting Audio...")
-    command = ["ffmpeg", "-i", video_path, "-q:a", "0", "-map", "a", audio_path, "-y"]
+    # Start Medical Transcription
+    transcribe_job_name = f"medical_{video_name.replace('.', '_')}"
+    transcribe_client.start_medical_transcription_job(
+        MedicalTranscriptionJobName=transcribe_job_name,
+        LanguageCode="en-US",
+        Media={"MediaFileUri": s3_audio_uri},
+        MediaFormat="mp3",
+        Specialty="PRIMARYCARE",
+        Type="DICTATION",
+    )
 
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        st.error("❌ Audio extraction failed! Please check FFmpeg installation.")
-        st.text(result.stderr)
-    elif not os.path.exists(audio_path):
-        st.error("❌ Audio file was not created. Something went wrong with FFmpeg.")
-    else:
-        st.success("✅ Audio extraction successful!")
-        st.audio(audio_path)  # Play extracted audio
+    st.info("📝 Transcribing audio using Amazon Transcribe Medical...")
 
-        # Transcribe using Whisper
-        st.subheader("📝 Transcribing Speech...")
-        whisper_command = ["whisper", audio_path, "--model", "small", "--output_dir", ".", "--output_format", "txt"]
+    # Wait for Transcription to complete
+    while True:
+        status = transcribe_client.get_medical_transcription_job(MedicalTranscriptionJobName=transcribe_job_name)
+        if status["MedicalTranscriptionJob"]["TranscriptionJobStatus"] in ["COMPLETED", "FAILED"]:
+            break
+        time.sleep(5)
 
-        whisper_result = subprocess.run(whisper_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if status["MedicalTranscriptionJob"]["TranscriptionJobStatus"] == "COMPLETED":
+        transcript_uri = status["MedicalTranscriptionJob"]["Transcript"]["TranscriptFileUri"]
+        response = requests.get(transcript_uri)
+        transcript_json = response.json()
+        transcript_text = transcript_json["results"]["transcripts"][0]["transcript"]
+        st.text_area("📝 Transcription:", transcript_text)
 
-        # Debug logs
-        #st.text_area("Whisper Debug Logs", whisper_result.stderr, height=100)
+        # Medical Sentiment Analysis
+        sentiment_response = comprehend_client.detect_entities(Text=transcript_text)
+        entities = sentiment_response["Entities"]
+        st.write("🔍 **Detected Medical Entities:**", entities)
 
-        # Wait for Whisper to complete
-        #time.sleep(2)
+        # Store Results in DynamoDB
+        table = dynamodb_client.Table(DYNAMODB_TABLE)
+        table.put_item(
+            Item={
+                "VideoName": video_name,
+                "Transcript": transcript_text,
+                "Analysis": json.dumps(entities)
+            }
+        )
+        st.success("✅ Results stored in DynamoDB!")
 
-        # Find the latest transcript file
-        transcript_files = glob.glob("*.txt")  # Find all .txt files
-        transcript_path = None
-
-        for file in transcript_files:
-            if file != "cookies.txt":  # Ignore unwanted files
-                transcript_path = file
-                break
-
-        if not transcript_path:
-            st.error("❌ Transcript file not found. Whisper may have failed.")
-        else:
-            # Read the latest transcript
-            with open(transcript_path, "r", encoding="utf-8") as file:
-                transcript = file.read().strip()
-                st.text_area("Transcription:", transcript, height=200)
-
-            # Perform Sentiment Analysis only if transcript is valid
-            if transcript:
-                st.subheader("📊 Sentiment Analysis:")
-                sentiment_model = pipeline("sentiment-analysis")
-
-                # Token limit per DistilBERT model
-                MAX_TOKENS = 512
-                transcript_chunks = textwrap.wrap(transcript, width=MAX_TOKENS)
-
-                sentiment_results = []
-                for i, chunk in enumerate(transcript_chunks):
-                    sentiment_result = sentiment_model(chunk)
-                    sentiment_results.append(sentiment_result[0])
-
-                # Display sentence-wise sentiment
-                for i, result in enumerate(sentiment_results):
-                    st.write(f"**Part {i+1}:** {result['label']} (Score: {result['score']:.2f})")
-
-    st.success("🚀 App is running successfully!") """)
+# 📊 View Past Analyses
+if st.button("📂 View Past Analyses"):
+    table = dynamodb_client.Table(DYNAMODB_TABLE)
+    response = table.scan()
+    for item in response["Items"]:
+        st.write(f"📂 **Video:** {item['VideoName']}")
+        st.write(f"📝 **Transcript:** {item['Transcript']}")
+        st.write(f"🔍 **Analysis:** {item['Analysis']}")
 
